@@ -16,9 +16,15 @@
 # limitations under the License.
 #
 
+require 'rbsigar'
+
+sigar = Sigar.new
+
 provides "network", "counters/network"
 
-network[:default_interface] = from("route -n \| grep ^0.0.0.0 \| awk \'{print \$8\}\'")
+ninfo = sigar.net_info
+network[:default_interface] = ninfo.default_interface
+network[:default_gateway] = ninfo.default_gateway
 
 def encaps_lookup(encap)
   return "Loopback" if encap.eql?("Local Loopback")
@@ -32,71 +38,51 @@ end
 
 iface = Mash.new
 net_counters = Mash.new
-popen4("ifconfig -a") do |pid, stdin, stdout, stderr|
-  stdin.close
-  cint = nil
-  stdout.each do |line|
-    tmp_addr = nil
-    if line =~ /^([0-9a-zA-Z\.\:\-]+)\s+/
-      cint = $1
-      iface[cint] = Mash.new
-      if cint =~ /^(\w+)(\d+.*)/
-        iface[cint][:type] = $1
-        iface[cint][:number] = $2
-      end
+
+sigar.net_interface_list.each do |cint|
+  iface[cint] = Mash.new
+  if cint =~ /^(\w+)(\d+.*)/
+    iface[cint][:type] = $1
+    iface[cint][:number] = $2
+  end
+  ifconfig = sigar.net_interface_config(cint)
+  iface[cint][:encapsulation] = encaps_lookup(ifconfig.type)
+  iface[cint][:addresses] = Mash.new
+  # Backwards compat: loopback has no hwaddr
+  if (ifconfig.flags & Sigar::IFF_LOOPBACK) == 0
+    iface[cint][:addresses][ifconfig.hwaddr] = { "family" => "lladdr" }
+  end
+  if ifconfig.address != "0.0.0.0"
+    iface[cint][:addresses][ifconfig.address] = { "family" => "inet" }
+    # Backwards compat: no broadcast on tunnel or loopback dev
+    if (((ifconfig.flags & Sigar::IFF_POINTOPOINT) == 0) &&
+          ((ifconfig.flags & Sigar::IFF_LOOPBACK) == 0))
+      iface[cint][:addresses][ifconfig.address]["broadcast"] = ifconfig.broadcast
     end
-    if line =~ /Link encap:(Local Loopback)/ || line =~ /Link encap:(.+?)\s/
-      iface[cint][:encapsulation] = encaps_lookup($1)
-    end
-    if line =~ /HWaddr (.+?)\s/
-      iface[cint][:addresses] = Mash.new unless iface[cint][:addresses]
-      iface[cint][:addresses][$1] = { "family" => "lladdr" }
-    end
-    if line =~ /inet addr:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/
-      iface[cint][:addresses] = Mash.new unless iface[cint][:addresses]
-      iface[cint][:addresses][$1] = { "family" => "inet" }
-      tmp_addr = $1
-    end
-    if line =~ /inet6 addr: ([a-f0-9\:]+)\/(\d+) Scope:(\w+)/
-      iface[cint][:addresses] = Mash.new unless iface[cint][:addresses]
-      iface[cint][:addresses][$1] = { "family" => "inet6", "prefixlen" => $2, "scope" => ($3.eql?("Host") ? "Node" : $3) }
-    end
-    if line =~ /Bcast:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/
-      iface[cint][:addresses][tmp_addr]["broadcast"] = $1
-    end
-    if line =~ /Mask:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/
-      iface[cint][:addresses][tmp_addr]["netmask"] = $1
-    end
-    flags = line.scan(/(UP|BROADCAST|DEBUG|LOOPBACK|POINTTOPOINT|NOTRAILERS|RUNNING|NOARP|PROMISC|ALLMULTI|SLAVE|MASTER|MULTICAST|DYNAMIC)\s/)
-    if flags.length > 1
-      iface[cint][:flags] = flags.flatten
-    end
-    if line =~ /MTU:(\d+)/
-      iface[cint][:mtu] = $1
-    end
-    if line =~ /RX packets:(\d+) errors:(\d+) dropped:(\d+) overruns:(\d+) frame:(\d+)/
-      net_counters[cint] = Mash.new unless net_counters[cint]
-      net_counters[cint][:rx] = { "packets" => $1, "errors" => $2, "drop" => $3, "overrun" => $4, "frame" => $5 }
-    end
-    if line =~ /TX packets:(\d+) errors:(\d+) dropped:(\d+) overruns:(\d+) carrier:(\d+)/
-      net_counters[cint][:tx] = { "packets" => $1, "errors" => $2, "drop" => $3, "overrun" => $4, "carrier" => $5 }
-    end
-    if line =~ /collisions:(\d+)/
-      net_counters[cint][:tx]["collisions"] = $1
-    end
-    if line =~ /txqueuelen:(\d+)/
-      net_counters[cint][:tx]["queuelen"] = $1
-    end
-    if line =~ /RX bytes:(\d+) \((\d+?\.\d+ .+?)\)/
-      net_counters[cint][:rx]["bytes"] = $1
-    end
-    if line =~ /TX bytes:(\d+) \((\d+?\.\d+ .+?)\)/
-      net_counters[cint][:tx]["bytes"] = $1
-    end
+    iface[cint][:addresses][ifconfig.address]["netmask"] = ifconfig.netmask
+  end
+  iface[cint][:flags] = Sigar.net_interface_flags_to_s(ifconfig.flags).split(' ')
+  iface[cint][:mtu] = ifconfig.mtu.to_s
+  iface[cint][:queuelen] = ifconfig.tx_queue_len.to_s
+  if ifconfig.prefix6_length != 0
+    iface[cint][:addresses][ifconfig.address6] = { "family" => "inet6" }
+    iface[cint][:addresses][ifconfig.address6]["prefixlen"] = ifconfig.prefix6_length.to_s
+    iface[cint][:addresses][ifconfig.address6]["scope"] = Sigar.net_scope_to_s(ifconfig.scope6)
+  end
+  net_counters[cint] = Mash.new unless net_counters[cint]
+  if (!cint.include?(":"))
+    ifstat = sigar.net_interface_stat(cint)
+    net_counters[cint][:rx] = { "packets" => ifstat.rx_packets.to_s, "errors"     => ifstat.rx_errors.to_s,
+                                "drop"    => ifstat.rx_dropped.to_s, "overrun"    => ifstat.rx_overruns.to_s,
+                                "frame"   => ifstat.rx_frame.to_s,   "bytes"      => ifstat.rx_bytes.to_s }
+    net_counters[cint][:tx] = { "packets" => ifstat.tx_packets.to_s, "errors"     => ifstat.tx_errors.to_s,
+                                "drop"    => ifstat.tx_dropped.to_s, "overrun"    => ifstat.tx_overruns.to_s,
+                                "carrier" => ifstat.tx_carrier.to_s, "collisions" => ifstat.tx_collisions.to_s,
+                                "bytes"   => ifstat.tx_bytes.to_s }
   end
 end
 
-popen4("arp -an") do |pid, stdin, stdout, stderr|
+popen4("/sbin/arp -an") do |pid, stdin, stdout, stderr|
   stdin.close
   stdout.each do |line|
     if line =~ /^\S+ \((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\) at ([a-fA-F0-9\:]+) \[(\w+)\] on ([0-9a-zA-Z\.\:\-]+)/
