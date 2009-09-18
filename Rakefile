@@ -4,16 +4,17 @@ require 'rubygems/specification'
 require 'date'
 require 'spec/rake/spectask'
 
-GEM = "ohai"
-GEM_VERSION = "0.3.3"
+NAME = "ohai"
+VERSION = "0.3.3"
 AUTHOR = "Adam Jacob"
 EMAIL = "adam@opscode.com"
 HOMEPAGE = "http://wiki.opscode.com/display/ohai"
 SUMMARY = "Ohai profiles your system and emits JSON"
+FILES = %w(LICENSE README.rdoc Rakefile) + Dir.glob("{extras,lib,spec}/**/*")
 
 spec = Gem::Specification.new do |s|
-  s.name = GEM
-  s.version = GEM_VERSION
+  s.name = NAME 
+  s.version = VERSION
   s.platform = Gem::Platform::RUBY
   s.has_rdoc = true
   s.summary = SUMMARY
@@ -29,8 +30,8 @@ spec = Gem::Specification.new do |s|
   s.executables = %w(ohai)
   
   s.require_path = 'lib'
-  s.autorequire = GEM
-  s.files = %w(LICENSE README.rdoc Rakefile) + Dir.glob("{extras,lib,spec}/**/*")
+  s.autorequire = NAME
+  s.files = FILES
 end
 
 task :default => :spec
@@ -48,12 +49,18 @@ end
 
 desc "install the gem locally"
 task :install => [:package] do
-  sh %{sudo gem install pkg/#{GEM}-#{GEM_VERSION}}
+  sh %{sudo gem install pkg/#{NAME}-#{VERSION}}
 end
 
 desc "create a gemspec file"
 task :make_spec do
-  File.open("#{GEM}.gemspec", "w") do |file|
+  File.open("#{NAME}.gemspec", "w") do |file|
     file.puts spec.to_ruby
   end
+end
+
+Rake::PackageTask.new(NAME, VERSION) do |pkg|
+  pkg.need_tar_gz = true
+  pkg.need_tar_bz2 = true
+  pkg.package_files = FILES
 end
